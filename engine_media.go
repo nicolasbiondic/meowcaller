@@ -99,12 +99,12 @@ func (e *engine) maybeStartMedia(callID string) {
 		call.setPhase(CallPhaseConnecting)
 	}
 	e.c.log.Info().Str("call_id", callID).Msg("starting media")
-	go func() {
+	safeGo("media start", func() {
 		defer clear(callKey)
 		if err := e.runMedia(mctx, callID, call, callKey, selfLID, peerLID, rd, inbound); err != nil {
 			e.c.log.Warn().Err(err).Str("call_id", callID).Msg("media ended")
 		}
-	}()
+	})
 }
 
 // connectAndAllocateAll opens a relay DataChannel and sends the STUN allocate
@@ -183,10 +183,10 @@ func (e *engine) connectOneRelay(ctx context.Context, rd *relayData, ep *relayEn
 		err error
 	}
 	done := make(chan result, 1)
-	go func() {
+	safeGo("relay connect", func() {
 		ch, err := relay.ConnectRelayMedia(addr, relay.WithLogger(log))
 		done <- result{ch, err}
-	}()
+	})
 	var ch *relay.RelayMediaChannel
 	select {
 	case r := <-done:
@@ -445,7 +445,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	}()
 	audioMixer := newParticipantAudioMixer()
 	var audioSinkFramer participantAudioSinkFramer
-	go func() {
+	safeGo("group audio mixer", func() {
 		ticker := time.NewTicker(time.Duration(participantAudioMixChunkSamples) * time.Second / SampleRate)
 		defer ticker.Stop()
 		playoutStarted := false
@@ -485,7 +485,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 					Msg("started participant-mixed inbound audio playout")
 			}
 		}
-	}()
+	})
 	txPipe, err := NewMediaPipeline(callKey, selfLID, peerLID, ssrc, FrameSamples, WithLogger(log))
 	if err != nil {
 		return err
@@ -519,7 +519,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 
 	// Inbound calls are torn down by the caller within ~400ms if the relay bind never
 	// comes alive; check at 400ms and 900ms and say so explicitly.
-	go func() {
+	safeGo("relay bind check", func() {
 		for _, d := range []time.Duration{400 * time.Millisecond, 900 * time.Millisecond} {
 			select {
 			case <-ctx.Done():
@@ -530,14 +530,14 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				log.Warn().Dur("after", d).Msg("relay silent after allocate, no bytes back yet (allocate undelivered or rejected)")
 			}
 		}
-	}()
+	})
 
 	// Keepalive: re-send the Allocate AND a WhatsApp ping (0x0801) ~1 Hz. This matches the
 	// working capture exactly — allocate+ping every second, NO STUN binding-requests at
 	// all; the relay answers allocate-success + pong and bridges the peer's media.
 	// Binding-requests instead flip the relay into ICE-consent mode and the bridge never
 	// forms.
-	go func() {
+	safeGo("relay keepalive", func() {
 		t := time.NewTicker(time.Second)
 		defer t.Stop()
 		var tickCount uint64
@@ -622,14 +622,14 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				"tx_id_hex": hex.EncodeToString(tx[:]), "ping_hex": hex.EncodeToString(ping[:]),
 			})
 		}
-	}()
+	})
 
 	// Send loop: frame-paced from connect, NOT gated on the Player. WhatsApp starts media
 	// on relay connection and the relay learns our SSRC from our FIRST RTP — it won't
 	// bridge the peer's media until it sees our stream. So we send silence frames until the
 	// Player has real audio (nextFrame() == nil means send silence).
 	frameInterval := time.Duration(FrameSamples) * time.Second / SampleRate
-	go func() {
+	safeGo("audio send loop", func() {
 		silence := make([]float32, FrameSamples)
 		ticker := time.NewTicker(frameInterval)
 		defer ticker.Stop()
@@ -666,7 +666,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				e.c.diag.Emit("meta", map[string]any{"event": "first_rtp_sent", "call_id": callID, "bytes": len(packet)})
 			}
 		}
-	}()
+	})
 
 	// Receive: DataChannel → classify. RTP → unprotect → decode → sink. A non-RTP STUN
 	// binding request gets a binding-success reply (ICE consent freshness, RFC 7675);
@@ -806,7 +806,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	// WhatsApp associates the RTP streams with an SRTCP session. Periodic compound
 	// SR+SDES packets are required for the caller's video to start flowing to the
 	// answerer, and give the peer a target for PLI/FIR recovery feedback.
-	go func() {
+	safeGo("srtcp report loop", func() {
 		ticker := time.NewTicker(1500 * time.Millisecond)
 		defer ticker.Stop()
 		var sent uint64
@@ -870,7 +870,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				})
 			}
 		}
-	}()
+	})
 
 	// Inbound audio and video go through the reorder stage before the loop sees them.
 	var observeAudio func(ssrc uint32, seq uint16, timestamp uint32)

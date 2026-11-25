@@ -605,7 +605,7 @@ func (e *engine) startWaitingRoomHeartbeat(callID string) {
 	m.waitingRoomCancel = cancel
 	creator := m.creator
 	e.mu.Unlock()
-	go func() {
+	safeGo("waiting-room heartbeat", func() {
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -619,7 +619,7 @@ func (e *engine) startWaitingRoomHeartbeat(callID string) {
 				}
 			}
 		}
-	}()
+	})
 }
 
 func valueOrZero(value *uint32) uint32 {

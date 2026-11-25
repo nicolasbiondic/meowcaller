@@ -93,7 +93,7 @@ func newReorderingReceiver(
 	}
 	r.timer = time.NewTimer(time.Hour)
 	r.timer.Stop()
-	go func() {
+	safeGo("audio reorder loop", func() {
 		buf := make([]byte, 1500)
 		for {
 			n, err := recv(buf)
@@ -110,7 +110,7 @@ func newReorderingReceiver(
 				return
 			}
 		}
-	}()
+	})
 	return r
 }
 
