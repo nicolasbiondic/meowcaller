@@ -167,26 +167,53 @@ func (e *engine) install() {
 		e.c.log.Error().Err(err).Msg("raw call adapter is unavailable")
 	}
 	e.c.wa.AddEventHandler(func(evt any) {
-		switch ev := evt.(type) {
-		case *events.CallOffer:
-			e.onOffer(ev)
-		case *events.CallPreAccept:
-			e.onPreAccept(ev)
-		case *events.CallAccept:
-			e.onAccept(ev)
-		case *events.CallRelayLatency:
-			e.onRelay(ev.CallID, ev.Data)
-			e.onRelayLatency(ev)
-		case *events.CallTransport:
-			e.onRelay(ev.CallID, ev.Data)
-		case *events.CallTerminate:
-			e.onTerminate(ev.CallID, ev.Reason)
-		case *events.CallReject:
-			e.onReject(ev)
-		case *events.UnknownCallEvent:
-			e.onUnknownCallEvent(ev.Node)
-		}
+		// whatsmeow stops calling the remaining handlers of an event when one
+		// panics, so a call-engine bug must not reach its dispatcher.
+		safeCall("event handler", func() { e.handleEvent(evt) })
 	})
+}
+
+// RawHookErr reports why the low-level <call>/<ack> interception could not be
+// installed (nil when it is in place). Without it inbound calls still ring but
+// outbound relay allocation and some call controls are not seen.
+func (c *Client) RawHookErr() error {
+	c.eng.mu.Lock()
+	defer c.eng.mu.Unlock()
+	return c.eng.rawCallHookErr
+}
+
+// engaged reports whether the engine tracks callID (an offer the filter let
+// through, or an outbound call). Stanzas of other calls are left to whatsmeow.
+func (e *engine) engaged(callID string) bool {
+	if callID == "" {
+		return false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	_, ok := e.calls[callID]
+	return ok
+}
+
+func (e *engine) handleEvent(evt any) {
+	switch ev := evt.(type) {
+	case *events.CallOffer:
+		e.onOffer(ev)
+	case *events.CallPreAccept:
+		e.onPreAccept(ev)
+	case *events.CallAccept:
+		e.onAccept(ev)
+	case *events.CallRelayLatency:
+		e.onRelay(ev.CallID, ev.Data)
+		e.onRelayLatency(ev)
+	case *events.CallTransport:
+		e.onRelay(ev.CallID, ev.Data)
+	case *events.CallTerminate:
+		e.onTerminate(ev.CallID, ev.Reason)
+	case *events.CallReject:
+		e.onReject(ev)
+	case *events.UnknownCallEvent:
+		e.onUnknownCallEvent(ev.Node)
+	}
 }
 
 func (e *engine) sendReaction(callID, emoji string) error {
@@ -552,6 +579,14 @@ func (e *engine) placeCall(ctx context.Context, target string, opts CallOptions)
 // preparation step, independent of the later Answer/Reject), and fires the
 // OnIncomingCall listener. Only the <accept> is deferred to Answer.
 func (e *engine) onOffer(ev *events.CallOffer) {
+	if f := e.c.offerFilter; f != nil {
+		engage := false
+		safeCall("offer filter", func() { engage = f(ev) })
+		if !engage {
+			e.c.log.Debug().Str("call_id", ev.CallID).Msg("offer filtered out; leaving the call to whatsmeow")
+			return
+		}
+	}
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/33854919e64bdd4b053054ac9764d8fc63027b57/datasheets/voip-group-invite-accept.md#L28-L40
 	groupSnapshot, isGroup, groupErr := signaling.ParseGroupInviteSnapshot(ev.Data)
 	if groupErr != nil {
@@ -1183,7 +1218,8 @@ func (e *engine) onCallAck(ack *waBinary.Node) {
 		if m := e.lookup(callID); m != nil && !m.group && m.direction == CallDirectionIncoming && e.acceptGoneOut(m) {
 			e.c.log.Warn().Str("call_id", callID).Str("error_code", errCode).Str("ack_type", ack.AttrGetter().OptionalString("type")).
 				Msg("server error ack after our accept; keeping the answered call while audio flows")
-			go e.guardAcceptErrorAck(callID, m, errCode, time.Now())
+			now := time.Now()
+			safeGo("accept error-ack guard", func() { e.guardAcceptErrorAck(callID, m, errCode, now) })
 			return
 		}
 		e.c.log.Warn().Str("call_id", callID).Str("error_code", errCode).Msg("call rejected by server")
@@ -1220,6 +1256,21 @@ func (e *engine) onCallAck(ack *waBinary.Node) {
 // onCallRaw sees every raw <call> node before whatsmeow processes it. It fires the
 // deferred <accept> when the caller's first <mute_v2> arrives (whatsmeow surfaces no
 // mute event, so this is the only place we see it).
+// onCallRawFiltered skips the raw interception for calls the offer filter left
+// to whatsmeow, so their control stanzas get whatsmeow's usual handling.
+func (e *engine) onCallRawFiltered(callNode *waBinary.Node) bool {
+	if e.c.offerFilter != nil {
+		kids := callNode.GetChildren()
+		if len(kids) == 0 {
+			return false
+		}
+		if !e.engaged(kids[0].AttrGetter().OptionalString("call-id")) {
+			return false
+		}
+	}
+	return e.onCallRaw(callNode)
+}
+
 // onCallRaw inspects a raw <call> node before whatsmeow processes it. It returns true when
 // it has fully handled the node (including sending the appropriate ack), so the caller skips
 // whatsmeow's generic typeless ack.
@@ -1527,7 +1578,7 @@ func (e *engine) installCallAckHook() error {
 			}
 			return nil
 		}
-		e.onCallAck(node)
+		safeCall("call ack hook", func() { e.onCallAck(node) })
 		return nil
 	})
 	handlers.SetMapIndex(reflect.ValueOf("ack"), ackHandler)
@@ -1537,7 +1588,9 @@ func (e *engine) installCallAckHook() error {
 		// onCallRaw returns true when it fully handled the node (incl. its own ack), so
 		// whatsmeow's generic typeless ack is skipped — the <video> upgrade needs a typed
 		// type="video" ack, which a bare ack does not satisfy (the peer reverts otherwise).
-		if e.onCallRaw(node) {
+		handled := false
+		safeCall("call node hook", func() { handled = e.onCallRawFiltered(node) })
+		if handled {
 			return nil
 		}
 		if origCall.IsValid() && !origCall.IsNil() {

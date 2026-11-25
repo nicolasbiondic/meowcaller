@@ -5,6 +5,7 @@ import (
 
 	"github.com/purpshell/meowcaller/diag"
 	"github.com/rs/zerolog"
+	"go.mau.fi/whatsmeow/types/events"
 )
 
 // Option configures optional, non-behavioral aspects of the call/media types —
@@ -18,6 +19,7 @@ type config struct {
 	audioRTP      func(callID string, ssrc uint32, seq uint16, timestamp uint32)
 	reorderWindow time.Duration
 	reorderReport func(callID string, audio, video AudioReorderReport)
+	offerFilter   func(*events.CallOffer) bool
 }
 
 func resolveConfig(opts []Option) config {

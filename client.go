@@ -12,6 +12,7 @@ import (
 	"github.com/rs/zerolog"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 )
 
 // Client is the managed entry point to the WhatsApp calling stack. It wraps a
@@ -28,6 +29,7 @@ type Client struct {
 	audioRTP      func(callID string, ssrc uint32, seq uint16, timestamp uint32)
 	reorderWindow time.Duration
 	reorderReport func(callID string, audio, video AudioReorderReport)
+	offerFilter   func(*events.CallOffer) bool
 
 	getGroupInfo func(context.Context, types.JID) (*types.GroupInfo, error)
 	ownGroupJIDs func() []types.JID
@@ -61,6 +63,7 @@ func NewClient(wa *whatsmeow.Client, opts ...Option) *Client {
 		audioRTP:      cfg.audioRTP,
 		reorderWindow: cfg.reorderWindow,
 		reorderReport: cfg.reorderReport,
+		offerFilter:   cfg.offerFilter,
 		getGroupInfo:  wa.GetGroupInfo,
 		ownGroupJIDs: func() []types.JID {
 			return []types.JID{wa.Store.GetJID(), wa.Store.GetLID()}

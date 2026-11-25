@@ -52,7 +52,8 @@ func newRelayFanout(chans []*relay.RelayMediaChannel, allocs [][]byte, names []s
 		live:    len(chans),
 	}
 	for _, ch := range chans {
-		go f.readLoop(ch)
+		ch := ch
+		safeGo("relay fanout read loop", func() { f.readLoop(ch) })
 	}
 	return f
 }
